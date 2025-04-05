@@ -1,0 +1,244 @@
+---
+title: "Untitled"
+output: html_document
+date: "2025-03-30"
+---
+
+
+```{r}
+library(dplyr)
+library(stringr)
+library(lubridate) 
+library(forecast)
+library(zoo)
+library(tidyr)
+#install.packages('astsa')
+library(astsa)
+#install.packages("terra")
+library(terra)
+library(stars)
+library(mgcv)
+```
+
+```{r}
+prices <- read.csv("Daily Prices_ICCO.csv") %>%
+  mutate(
+    Date = dmy(Date),
+    Price = as.numeric(str_remove_all(ICCO.daily.price..US..tonne., ","))
+  ) %>%
+  select(Date, Price) %>%
+  arrange(Date) %>%  
+
+  mutate(
+    Price = na.locf(Price, na.rm = FALSE),      
+    Price = na.locf(Price, fromLast = TRUE),    
+    Price = ifelse(is.na(Price), mean(Price, na.rm = TRUE), Price)
+  )
+
+weather <- read.csv("Ghana_data.csv") %>%
+  mutate(
+    DATE = as.Date(DATE),
+    PRCP = replace_na(PRCP, 0),  
+
+    TAVG = na.approx(TAVG, na.rm = FALSE),
+    TMAX = na.approx(TMAX, na.rm = FALSE),
+    TMIN = na.approx(TMIN, na.rm = FALSE)
+  ) %>%
+
+  group_by(DATE) %>%
+  summarise(
+    PRCP = mean(PRCP, na.rm = TRUE),
+    TAVG = mean(TAVG, na.rm = TRUE),
+    TMAX = max(TMAX, na.rm = TRUE),
+    TMIN = min(TMIN, na.rm = TRUE)
+  )
+
+merged_data <- prices %>%
+  left_join(weather, by = c("Date" = "DATE")) %>%
+  drop_na()  
+
+write.csv(merged_data, "cleaned_cocoa_data.csv", row.names = FALSE)
+```
+
+
+```{r}
+library(tidyverse)
+library(forecast)  
+library(tseries)   
+library(lubridate) 
+
+clean_data <- read.csv("cleaned_cocoa_data.csv") 
+
+```
+
+
+```{r}
+#cv <- sd(price_ts) / mean(price_ts)
+#cv
+```
+
+
+```{r}
+library(dplyr)
+library(readr)
+
+wind <- read.csv("wind.csv")
+
+wind <- wind %>%
+  mutate(
+    valid_time = ymd_hms(valid_time),
+    DATE = as.Date(valid_time)
+  )
+
+# Aggregate to daily mean of u10 and v10
+daily_wind <- wind %>%
+  group_by(DATE) %>%
+  summarise(
+    u10 = max(u10, na.rm = TRUE),
+    v10 = max(v10, na.rm = TRUE)
+  )
+
+# Make sure the date columns are properly formatted
+cocoa_data <- clean_data %>%
+  mutate(Date = as.Date(Date))
+
+daily_wind <- daily_wind %>%
+  mutate(DATE = as.Date(DATE))
+
+# Join wind data to cocoa dataset (left join: cocoa_data as base)
+cocoa_cleaned_wind <- cocoa_data %>%
+  left_join(daily_wind, by = c("Date" = "DATE"))
+
+cocoa_cleaned_wind <- cocoa_cleaned_wind %>% mutate(windspeed = sqrt(u10^2+v10^2))
+
+# Optional: write merged data to file
+write_csv(cocoa_cleaned_wind, "cocoa_with_wind.csv")
+```
+
+```{r}
+price_ts <- ts(cocoa_cleaned_wind$Price, frequency = 365) 
+plot.ts(price_ts)
+acf2(price_ts)
+#adf.test(cocoa_cleaned_wind$Price) 
+```
+
+```{r}
+ds <- diff(price_ts)
+plot(ds, main = "First Difference ", ylab = "Price", xlab = "Time")
+acf2(ds)
+```
+
+```{r}
+#install.packages('corrplot')
+cor_matrix <- cor(cocoa_cleaned_wind[, c("Price", "PRCP", "TAVG", "TMAX", "TMIN", "windspeed")])
+corrplot::corrplot(cor_matrix, method = "number")
+```
+
+```{r}
+split_idx <- floor(length(price_ts) * 0.9)
+
+train <- ts(price_ts[1:split_idx], start = start(price_ts), frequency = frequency(price_ts))
+
+test <- ts(price_ts[(split_idx + 1):length(price_ts)],
+           start = time(price_ts)[split_idx + 1],
+           frequency = frequency(price_ts))
+
+
+xreg_full <- cocoa_cleaned_wind %>%
+  select(PRCP, TMIN, TAVG, TMAX, windspeed)
+
+xreg_red <- cocoa_cleaned_wind %>%
+  select(PRCP, TMAX, windspeed) 
+```
+
+```{r}
+auto_model_red <- auto.arima(train, seasonal = TRUE, xreg = as.matrix(xreg_red[1:split_idx, ]))
+summary(auto_model_red)
+```
+
+```{r}
+auto_model_simple <- auto.arima(train, seasonal = TRUE)
+summary(auto_model_simple)
+```
+
+```{r}
+#auto_model_full <- auto_model <- auto.arima(train, seasonal = TRUE, xreg = as.matrix(xreg_full[1:split_idx, ]))
+#summary(auto_model_full)
+```
+
+```{r}
+auto_model_wind <- auto_model <- auto.arima(train, seasonal = TRUE, xreg = as.matrix(cocoa_cleaned_wind[1:split_idx, ]$windspeed))
+summary(auto_model_wind)
+```
+```{r}
+forecast_horizon <- length(test)
+
+xreg_red_test <- as.matrix(xreg_red[(split_idx + 1):nrow(xreg_red), ])
+
+
+forecast_red <- forecast(auto_model_red, xreg = xreg_red_test)
+
+```
+
+```{r}
+autoplot(forecast_red) +
+  autolayer(test, series = "Actual") +
+  ggtitle("ARIMA Forecast vs Actual") +
+  xlab("Time") + ylab("Price") +
+  theme_minimal()
+```
+
+```{r}
+
+# Step 1: Prepare training data with lagged predictors
+cocoa_lagged <- cocoa_cleaned_wind %>%
+  mutate(
+    windspeed_lag1 = lag(windspeed, 1),
+    TMAX_lag1 = lag(TMAX, 1),
+    PRCP_lag1 = lag(PRCP, 1)
+  ) %>%
+  na.omit()
+
+# Step 2: Fit the GAM model
+gam_model <- gam(Price ~ s(windspeed_lag1) + s(TMAX_lag1) + s(PRCP_lag1),
+                 data = cocoa_lagged)
+
+# Step 3: Prepare test weather data (match lag structure)
+test_weather <- cocoa_cleaned_wind[(split_idx + 1):nrow(cocoa_cleaned_wind), ]
+test_weather_lagged <- test_weather %>%
+  mutate(
+    windspeed_lag1 = lag(windspeed, 1),
+    TMAX_lag1 = lag(TMAX, 1),
+    PRCP_lag1 = lag(PRCP, 1)
+  ) %>%
+  na.omit()
+
+# Step 4: Forecast using test weather as input
+forecast_gam <- predict(gam_model, newdata = test_weather_lagged, se.fit = TRUE)
+
+```
+
+```{r}
+test_price_actual <- test_weather_lagged$Price  # aligned with forecast_gam
+
+forecast_df <- data.frame(
+  day = 1:length(forecast_gam$fit),
+  predicted = forecast_gam$fit,
+  lower = forecast_gam$fit - 2 * forecast_gam$se.fit,
+  upper = forecast_gam$fit + 2 * forecast_gam$se.fit,
+  actual = test_price_actual
+)
+library(ggplot2)
+
+ggplot(forecast_df, aes(x = day)) +
+  geom_line(aes(y = predicted), color = "blue", size = 1, linetype = "solid") +
+  geom_ribbon(aes(ymin = lower, ymax = upper), fill = "lightblue", alpha = 0.3) +
+  geom_line(aes(y = actual), color = "red", size = 1, linetype = "dashed") +
+  ggtitle("GAM Forecast vs Actual Cocoa Price") +
+  xlab("Forecast Day") + ylab("Cocoa Price") +
+  scale_y_continuous(labels = scales::comma) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+```
+
